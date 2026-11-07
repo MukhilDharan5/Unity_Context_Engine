@@ -46,7 +46,7 @@ def new_bus():
 
 
 async def session(store: Store) -> None:
-    from dbus_next import Message, MessageType
+    from dbus_next import Message, MessageFlag, MessageType
 
     bus = new_bus()
     dirty = asyncio.Event()
@@ -60,7 +60,7 @@ async def session(store: Store) -> None:
         async with asyncio.timeout(2):
             reply = await bus.call(Message(
                 destination=destination, path=path, interface=interface,
-                member=member, signature=signature, body=body or [],
+                member=member, signature=signature, body=body or [], flags=MessageFlag.NO_AUTOSTART,
             ))
         if reply is None or reply.message_type == MessageType.ERROR:
             raise RuntimeError(reply.error_name if reply else "missing D-Bus reply")
@@ -85,25 +85,26 @@ async def session(store: Store) -> None:
                 pending.add(message.sender)
                 dirty.set()
 
-    async def properties(owner: str, interface: str) -> dict:
-        body = await call(owner, PATH, PROPERTIES, "GetAll", "s", [interface])
-        return {name: value.value for name, value in body[0].items()}
+    async def get_property(owner: str, interface: str, key: str):
+        try:
+            body = await call(owner, PATH, PROPERTIES, "Get", "ss", [interface, key])
+            return body[0].value
+        except (RuntimeError, TimeoutError):
+            return None
 
     async def read_player(name: str) -> Player | None:
         owner = owners[name]
-        try:
-            player = await properties(owner, PLAYER)
-        except (RuntimeError, TimeoutError):
+        playback, identity, desktop, fullscreen = await asyncio.gather(
+            get_property(owner, PLAYER, "PlaybackStatus"),
+            get_property(owner, ROOT, "Identity"),
+            get_property(owner, ROOT, "DesktopEntry"),
+            get_property(owner, ROOT, "Fullscreen"),
+        )
+        if not isinstance(playback, str):
             return None
-        try:
-            root = await properties(owner, ROOT)
-        except (RuntimeError, TimeoutError):
-            root = {}  # Fullscreen and DesktopEntry may be absent.
-        fullscreen = root.get("Fullscreen")
         return Player(
-            name=name, identity=root.get("Identity", name.removeprefix(ROOT + ".")),
-            desktop_entry=root.get("DesktopEntry", ""), pid=pids.get(owner),
-            playback=player.get("PlaybackStatus", "Unknown"),
+            name=name, identity=identity or name.removeprefix(ROOT + "."),
+            desktop_entry=desktop or "", pid=pids.get(owner), playback=playback,
             fullscreen=fullscreen if isinstance(fullscreen, bool) else None,
         )
 

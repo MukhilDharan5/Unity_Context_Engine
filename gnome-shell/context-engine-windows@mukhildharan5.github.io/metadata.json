@@ -1,0 +1,7 @@
+{
+  "uuid": "context-engine-windows@mukhildharan5.github.io",
+  "name": "Context Engine Windows",
+  "description": "Read-only window and focus information for Unity Context Engine.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "url": "https://github.com/MukhilDharan5/Unity_Context_Engine"
+}

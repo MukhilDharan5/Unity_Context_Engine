@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import Iterator
 import contextlib
 from dataclasses import replace
 import json
@@ -13,6 +14,7 @@ import re
 import shutil
 import struct
 
+from . import gnome
 from .model import Store, Window
 
 
@@ -26,18 +28,23 @@ async def close_writer(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
 
 
-def focused_node(tree: dict) -> Window | None:
-    if tree.get("focused") and (tree.get("app_id") or tree.get("window")):
+def tree_windows(tree: dict, fullscreen: bool = False) -> Iterator[tuple[Window, bool]]:
+    fullscreen = fullscreen or bool(tree.get("fullscreen_mode", 0))
+    if tree.get("app_id") or tree.get("window") or tree.get("shell"):
         props = tree.get("window_properties") or {}
-        return Window(
+        yield Window(
             app=tree.get("app_id") or props.get("class") or "",
             title=tree.get("name") or "", pid=tree.get("pid"),
-            fullscreen=bool(tree.get("fullscreen_mode", 0)), id=str(tree["id"]),
-        )
-    for child in tree.get("nodes", []) + tree.get("floating_nodes", []):
-        if (window := focused_node(child)) is not None:
-            return window
-    return None
+            fullscreen=fullscreen, id=str(tree["id"]),
+        ), bool(tree.get("focused"))
+    children = tree.get("nodes", []) + tree.get("floating_nodes", [])
+    rank = {node_id: index for index, node_id in enumerate(tree.get("focus", []))}
+    for child in sorted(children, key=lambda node: rank.get(node.get("id"), len(rank))):
+        yield from tree_windows(child, fullscreen)
+
+
+def focused_node(tree: dict) -> Window | None:
+    return next((window for window, focused in tree_windows(tree) if focused), None)
 
 
 async def i3_send(writer: asyncio.StreamWriter, kind: int, payload: str = "") -> None:
@@ -78,7 +85,13 @@ async def sway(store: Store, path: str) -> None:
         # cannot be mistaken for replies; queued events trigger a fresh snapshot.
         async def refresh() -> None:
             async with asyncio.timeout(2):
-                store.set_window(focused_node(await i3_tree(path)))
+                tree = await i3_tree(path)
+            if store.inventory:
+                views = tuple(tree_windows(tree))
+                focused = next((window for window, active in views if active), None)
+                store.set_desktop(focused, tuple(window for window, _ in views), ranked=True)
+            else:
+                store.set_window(focused_node(tree))
 
         await refresh()
         store.source("focus", "live", "i3/Sway IPC events")
@@ -89,13 +102,23 @@ async def sway(store: Store, path: str) -> None:
             if kind == (1 << 31) | 3:
                 change = event.get("change")
                 container = event.get("container") or {}
+                window_id = str(container.get("id"))
                 if change == "title":
-                    if store.window and str(container.get("id")) == store.window.id:
-                        store.set_window(replace(store.window, title=container.get("name") or ""))
-                    continue  # Background title churn needs no tree query.
-                if change not in {"focus", "fullscreen_mode", "close"}:
+                    title = container.get("name") or ""
+                    focused = store.window
+                    if focused and focused.id == window_id:
+                        focused = replace(focused, title=title)
+                    windows = store.open_windows
+                    if windows is not None:
+                        windows = tuple(replace(w, title=title) if w.id == window_id else w for w in windows)
+                    store.set_desktop(focused, windows)
+                    continue  # Title changes need no new tree query.
+                if change not in {"focus", "fullscreen_mode", "close"} and not (
+                    store.inventory and change == "new"
+                ):
                     continue
-                if change == "close" and store.window and str(container.get("id")) != store.window.id:
+                if (change == "close" and not store.inventory and store.window
+                        and window_id != store.window.id):
                     continue
             await refresh()
     finally:
@@ -122,12 +145,12 @@ def hypr_path() -> Path:
     return Path(runtime) / "hypr" / signature
 
 
-async def hypr_query(path: Path) -> dict:
-    # This is the single allowed Hyprland request. Close each request promptly;
-    # Hyprland handles this socket synchronously.
+async def hypr_query(path: Path, command: str = "activewindow") -> dict | list:
+    # Limit the command socket to information queries and close each request promptly.
+    request = {"activewindow": b"j/activewindow", "clients": b"j/clients"}[command]
     reader, writer = await asyncio.open_unix_connection(str(path / ".socket.sock"))
     try:
-        writer.write(b"j/activewindow")
+        writer.write(request)
         await writer.drain()
         chunks, size = [], 0
         while chunk := await reader.read(65536):
@@ -147,17 +170,27 @@ async def hyprland(store: Store) -> None:
     try:
         async def refresh() -> None:
             async with asyncio.timeout(1):
-                store.set_window(hypr_window(await hypr_query(path)))
+                focused = hypr_window(await hypr_query(path))
+                windows = None
+                if store.inventory:
+                    clients = await hypr_query(path, "clients")
+                    # Negative focusHistoryID means the client has no focus history.
+                    clients.sort(key=lambda c: (c.get("focusHistoryID", -1) < 0, c.get("focusHistoryID", -1)))
+                    windows = tuple(window for client in clients if client.get("mapped", True)
+                                    if (window := hypr_window(client)) is not None)
+            store.set_desktop(focused, windows, ranked=True)
 
         relevant = {b"activewindow", b"activewindowv2", b"windowtitle", b"windowtitlev2",
                     b"fullscreen", b"closewindow", b"workspace", b"workspacev2",
                     b"focusedmon", b"focusedmonv2"}
+        if store.inventory:
+            relevant.add(b"openwindow")
         dirty = asyncio.Event()
 
         async def read_events() -> None:
             while line := await reader.readline():
                 event, _, payload = line.partition(b">>")
-                if event == b"windowtitlev2" and store.window:
+                if event == b"windowtitlev2" and store.window and not store.inventory:
                     address = payload.partition(b",")[0].decode(errors="replace")
                     if address != store.window.id:
                         continue
@@ -221,7 +254,6 @@ async def xprop_lines(*args: str):
         assert process.stdout is not None
         while line := await process.stdout.readline():
             yield line.decode("utf-8", errors="replace").rstrip("\n")
-        raise Unavailable("xprop subscription ended; check DISPLAY and X11 permissions")
     finally:
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -238,30 +270,72 @@ async def x11(store: Store) -> None:
     if not shutil.which("xprop"):
         raise Unavailable("X11 requires xprop (usually the x11-utils / xorg-xprop package)")
 
+    properties_to_read = ("WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_STATE", "_NET_WM_PID")
+    clients: dict[str, Window] = {}
+    clients_known = False
+
+    def parse_property(properties: dict[str, str], line: str) -> None:
+        name, separator, value = line.partition(" = ")
+        if not separator:
+            name = line.partition(":")[0]
+        if name in properties_to_read:
+            properties[name] = value
+
     async def window_watch(window_id: str) -> None:
         properties: dict[str, str] = {}
-        stream = xprop_lines("-spy", "-id", window_id, "WM_CLASS", "_NET_WM_NAME",
-                             "WM_NAME", "_NET_WM_STATE", "_NET_WM_PID")
+        stream = xprop_lines("-spy", "-id", window_id, *properties_to_read)
         try:
             async for line in stream:
-                name, separator, value = line.partition(" = ")
-                if separator:
-                    properties[name] = value
-                elif ":" in line:
-                    # A removed EWMH state property means no fullscreen state.
-                    name = line.partition(":")[0]
-                    properties[name] = ""
-                store.set_window(xprop_window(properties, window_id))
+                parse_property(properties, line)
+                if len(properties) != len(properties_to_read):
+                    continue  # Wait for PID and app ID before filtering our window.
+                window = xprop_window(properties, window_id)
+                if window_id in clients:
+                    clients[window_id] = window
+                store.set_desktop(window, tuple(clients.values()) if clients_known else None)
+            raise Unavailable("xprop focused window subscription ended")
         except (Unavailable, OSError, ValueError) as error:
             store.set_window(None)
             store.source("focus", "unavailable", f"{error}; waiting for next focus change")
         finally:
             await stream.aclose()
 
+    async def refresh_clients(line: str) -> None:
+        nonlocal clients_known
+        if "not found" in line or "no such atom" in line:
+            clients.clear()
+            clients_known = False
+            store.set_desktop(store.window, None)
+            return
+        ids = [hex(int(value, 16)) for value in re.findall(r"0x[0-9a-fA-F]+", line) if int(value, 16)]
+        windows = {}
+        for window_id in ids:
+            if window_id in clients:
+                windows[window_id] = clients[window_id]
+                continue
+            properties: dict[str, str] = {}
+            async with contextlib.aclosing(xprop_lines("-id", window_id, *properties_to_read)) as stream:
+                try:
+                    async with asyncio.timeout(1):
+                        async for prop in stream:
+                            parse_property(properties, prop)
+                except TimeoutError:
+                    continue
+            if properties:
+                windows[window_id] = xprop_window(properties, window_id)
+        clients.clear()
+        clients.update(windows)
+        clients_known = True
+        store.set_desktop(store.window, tuple(clients.values()))
+
     task: asyncio.Task | None = None
-    stream = xprop_lines("-spy", "-root", "_NET_ACTIVE_WINDOW")
+    root_properties = ("_NET_ACTIVE_WINDOW", "_NET_CLIENT_LIST") if store.inventory else ("_NET_ACTIVE_WINDOW",)
+    stream = xprop_lines("-spy", "-root", *root_properties)
     try:
         async for line in stream:
+            if line.startswith("_NET_CLIENT_LIST"):
+                await refresh_clients(line)
+                continue
             if task is not None:
                 task.cancel()
                 # A destroyed window is normal, and may end its helper first.
@@ -277,7 +351,8 @@ async def x11(store: Store) -> None:
                 detail += "; XWayland windows only (partial)"
             store.source("focus", "live", detail)
             if int(match[0], 16):
-                task = asyncio.create_task(window_watch(match[0]))
+                task = asyncio.create_task(window_watch(hex(int(match[0], 16))))
+        raise Unavailable("xprop root subscription ended; check DISPLAY and X11 permissions")
     finally:
         if task is not None:
             task.cancel()
@@ -294,6 +369,8 @@ def choose_backend(requested: str) -> str:
     if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         return "hyprland"
     if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        if "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":"):
+            return "gnome"
         return "unsupported-wayland"
     return "x11" if os.environ.get("DISPLAY") else "headless"
 
@@ -318,11 +395,16 @@ async def watch(store: Store, requested: str) -> None:
                 await sway(store, path)
             elif backend == "hyprland":
                 await hyprland(store)
+            elif backend == "gnome":
+                await gnome.watch(store)
             else:
                 await x11(store)
-        except (OSError, ValueError, KeyError, TypeError, TimeoutError,
+        except ImportError:
+            store.source("focus", "unavailable", "install dbus-next for GNOME Shell window access")
+            return
+        except (OSError, ValueError, KeyError, TypeError, EOFError, TimeoutError,
                 asyncio.IncompleteReadError, Unavailable) as error:
-            store.set_window(None)
+            store.set_desktop(None, None)
             store.source("focus", "unavailable", f"{error}; reconnecting in {delay}s")
         await asyncio.sleep(delay)
         delay = min(delay * 2, 30)

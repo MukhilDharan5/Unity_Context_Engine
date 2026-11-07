@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Context Engine
+Comment=See recent windows and predicted desktop workloads
+Exec=unity-context
+TryExec=unity-context
+Icon=io.github.MukhilDharan5.UnityContextEngine
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
+StartupWMClass=io.github.MukhilDharan5.UnityContextEngine
+Keywords=Workload;Windows;Desktop;Monitor;Context;

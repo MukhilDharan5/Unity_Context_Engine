@@ -1,124 +1,233 @@
-# Unity Context
+# Unity_Context_Engine
 
-A minimal, read-only Linux context TUI: focused application/window, fullscreen
-media, focused games, and compilation activity. Python 3.11+, curses, and one
-small Python dependency (`dbus-next`). No service, root privileges, telemetry,
-history files, screenshots, input hooks, or desktop settings changes.
+**Context Engine** is a read-only Linux desktop app built with GTK 4 and Libadwaita. **Overview** shows
+the predicted workload, the focused or last used window, and a preview of open
+windows. **Details** shows the full window list, the evidence behind each
+prediction, recent input status, CPU and memory measurements, resource pressure,
+active processes, media players, and collector status. Context
+Engine's own windows are excluded.
 
 ```bash
-python3 -m venv .venv
+python3 -m unity_context
+python3 -m unity_context --demo
+```
+
+The desktop app needs Python 3.11+, PyGObject, GTK 4, and Libadwaita 1.4 or newer.
+The launcher also needs `bubblewrap`, user namespaces, and `xdg-dbus-proxy`.
+Use your distribution's Python with the GTK and Libadwaita introspection packages.
+On Fedora these are `python3-gobject`, `gtk4`, and `libadwaita`. For media and
+GNOME Shell access, install `dbus-next`. You can install the project into a
+virtual environment that can use the system GTK bindings.
+
+```bash
+python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -e .
 .venv/bin/unity-context
 ```
 
-You can also run `python3 -m unity_context` directly from this directory.
-Media discovery requires `dbus-next`; everything else works without it. Some
-distributions package curses separately as `python3-curses`.
+## Window access
 
-Press **q** to quit, **j/k** or arrow keys to scroll, **Page Up/Down** to page,
-and **g** to return to the top. The view redraws on context, input, and resize
-events; there is no refresh timer or animated dashboard.
+| Session | Source |
+| --- | --- |
+| GNOME Wayland | Optional Context Engine Windows extension |
+| Sway / i3 | Native IPC events and window tree |
+| Hyprland | Native IPC events and read-only window queries |
+| X11 | EWMH via `xprop` (focus and window list) |
+| Other Wayland desktops | Window information unavailable |
 
-```text
-UNITY CONTEXT   /   READ ONLY
-Sway / wayland
+On X11, background window titles are sampled when windows first appear and
+refreshed when they gain focus. Sway/i3 and Hyprland require their session socket
+environment variables. Automatic detection uses native Wayland sources. An
+explicit `--focus x11` on Wayland can only see XWayland windows.
 
-Fullscreen media + Compiling
+### GNOME Wayland
 
-FOCUS
-  App         mpv
-  Window      A quiet evening
-  Fullscreen  yes
-
-MEDIA
-  mpv  /  Playing
-  Fullscreen media  yes
-
-ACTIVITY
-  Game        no matching app ID
-  Compiling   rustc (5678)
-
-SOURCES
-  focus: live / i3/Sway IPC events
-  media: live / MPRIS D-Bus property and player lifecycle signals
-  processes: live / /proc sampling every 3s; current user only
-```
-
-## Detection and overhead
-
-| Signal | How it is collected | Limitations |
-| --- | --- | --- |
-| Focus and fullscreen on Sway/i3 | Native IPC subscription, initial tree query and queries after relevant events | Requires `SWAYSOCK` or `I3SOCK` in the launch environment |
-| Focus and fullscreen on Hyprland | Native event socket and read-only `activewindow` queries | Requires the current session's socket environment |
-| Focus and fullscreen on X11 | EWMH property subscriptions through `xprop -spy` | Needs `xprop`; at most two idle helper processes |
-| Media | MPRIS discovery, `PropertiesChanged`, and player start/exit signals | Apps must expose MPRIS; no playback-position or metadata polling |
-| Compiling | Current user's `/proc` process names, state, start time and CPU ticks every 3 seconds | Heuristic; short builds between samples can be missed, names are limited by Linux `comm`, other users are excluded |
-| Game focused | `steam_app_<number>` window app IDs or exact `--game-app` IDs | Heuristic; no universal game flag exists; launchers, Wine, fullscreen, or high CPU alone do not imply a game |
-
-**GNOME/KDE on Wayland:** the built-in focus backends do not support these
-compositors. Focus, window fullscreen state, and focused game detection show
-unavailable/unknown. Media and compilation detection still work. The program
-does not install extensions, enable accessibility services, use Shell Eval,
-or change the session to bypass this limitation. Automatic detection never
-uses X11 as a substitute for native Wayland focus. Explicit `--focus x11` on
-Wayland exposes only XWayland windows, clearly labeled as partial.
-
-Fullscreen media requires a playing MPRIS player that reports fullscreen, or
-a fullscreen focused window matching the player's process ID or exact desktop
-entry. A browser playing background audio does not make an unrelated fullscreen
-app count as media. `null`/`unknown` means the evidence is unavailable. MPRIS
-cannot reliably distinguish audio from video; fullscreen media is an inference,
-and a player's self-reported fullscreen state does not prove that it is visible
-or on the active workspace.
-
-Compilation requires a recognized compiler that is runnable or consumed CPU
-since the previous sample. Sleeping build launchers and language servers do not
-count. Signals are independent, so media and compilation can appear together.
-Inaccessible and exited processes are skipped. `--once` can miss a sleeping
-compiler because it has no previous CPU sample. A negative game result means no
-matching app ID, not proof that the app is not a game.
-
-While connected, focus and media have no polling loop. Disconnects clear stale
-state and retry with a capped backoff. Process scans yield between batches of
-64 processes to keep the UI responsive without worker threads.
-`--no-processes` removes the only periodic device scan. No CPU or memory usage
-target is claimed; overhead depends on process count and event frequency.
-
-## Useful options
+GNOME Shell can supply native window information through the optional extension
+in this repository. Build and install it from the project directory.
 
 ```bash
-python3 -m unity_context --demo                 # sample TUI; no collectors
-python3 -m unity_context --once                 # one JSON snapshot
-python3 -m unity_context --json                 # JSON lines on changes
-python3 -m unity_context --no-processes         # event sources only
-python3 -m unity_context --process-interval 10  # slower compilation sampling
-python3 -m unity_context --game-app my-game --game-app org.example.Game
-python3 -m unity_context --focus none --no-media # compilation only
+extension=context-engine-windows@mukhildharan5.github.io
+gnome-extensions pack --force --out-dir /tmp "gnome-shell/$extension"
+gnome-extensions install --force "/tmp/$extension.shell-extension.zip"
+gnome-extensions enable "$extension"
 ```
 
-JSON output contains window titles, so treat it as personal data if you redirect
-or share it. The program stores nothing itself. It does not read process command
-lines, environment blocks, files being edited, media titles, or browser URLs.
-Window titles can still reveal document or website names. Terminal control
-characters are sanitized in the TUI and escaped in JSON.
+If GNOME Shell does not recognize a newly installed extension, log out and back
+in, then enable it. The app picks up the extension when it appears on the session
+bus. You can disable it with `gnome-extensions disable "$extension"`. The
+extension publishes a read-only window snapshot to local clients on your session
+bus. Window titles can include document and website names. With the extension
+disabled, media and compilation still work and window access is marked
+unavailable.
 
-One-shot JSON waits up to four seconds for initial collector discovery. Each
-source reports `starting`, `live`, `disabled`, or `unavailable`, with an explanation.
-Run inside the desktop session as your normal user; SSH, containers, and
-sandboxes may not have permission to access the display or session bus.
+## How predictions work
+
+Context Engine recognizes around 70 workload categories from application IDs,
+browser and terminal title hints, media playback, and measured process activity.
+These include coding, code hosting, CI, project management, online learning,
+research, design, meetings, bookkeeping, GIS, media editing, and gaming. Browser
+hints match product name segments of the title, so ordinary titles containing
+words such as “linear” do not suggest the project management app.
+
+The focused window usually drives the primary prediction. When Context Engine
+takes focus, the last observed external window can drive it while that window is
+still open. Supported compositors can provide a recent window at startup.
+Recognized compiler workers can make **Compiling** primary during coding or
+terminal work. Media and compiler signals can also appear as concurrent
+workloads. Active workers can also suggest tests, rendering, media processing,
+backups, file transfers, databases, containers, virtual machines, local AI, and
+other jobs. Details shows the worker names and measured CPU for these predictions.
+Unknown apps and missing signals are labeled explicitly.
+
+On GNOME, an idle threshold event marks a session without recent input after
+three minutes. A window by itself stops driving the prediction while idle.
+Playback and measured background jobs can still show up. Passive viewing can
+continue while the desktop has no input.
+
+Media uses MPRIS playback and player lifecycle events. Fullscreen media requires
+a playing player that reports fullscreen or matches the focused fullscreen
+window by process ID or desktop entry. Game detection uses Steam game IDs and
+exact `--game-app` matches. Compiler detection samples the current user's
+`/proc` process names and CPU ticks every three seconds. The same pass estimates
+CPU used by the current user's active processes and reads whole-system CPU,
+available memory, and 10-second resource pressure averages. A process's CPU is
+shown relative to one core. Resident memory can include shared pages. Short
+jobs can fall between samples.
+
+Windows, media, and GNOME idle status update from events. The app stores no
+history on disk. Use `--no-processes` to disable the periodic sampling.
+
+## Read-only access
+
+Context Engine runs as a regular user in a Bubblewrap sandbox. The app has zero
+Linux capabilities, cannot gain privileges on exec, and sees read-only host
+mounts, a private home and temporary directory, and an isolated network and
+process namespace. It reads current-user process counters from the mounted
+host procfs. Its launcher refuses to run the observer if the sandbox cannot
+start.
+
+The GNOME session bus is filtered to window snapshots, idle observation and
+subscriptions, media property reads, appearance settings reads, and Context
+Engine's own activation and local API, Unity device reads, and the Automation Engine context sink. Media queries read playback status, player identity, desktop
+entry, and fullscreen state. Sway/i3, Hyprland, and X11 use their local sockets
+and the app's read-only query code. The bundled GNOME extension runs within
+the user's Shell and exports its window snapshot there.
+
+## Local read-only API
+
+Context Engine exports a D-Bus API while the GUI is open. Use
+`unity-context --serve` to collect and serve data without a window, or
+`unity-context --no-api` to open the GUI with sharing disabled. Use one API
+provider at a time. A second provider leaves the first one in place. The API
+ends when its provider exits. For integration testing, `--serve --demo`
+publishes sample data without starting the collectors.
+
+Clients on the same D-Bus session can read the data, including window titles.
+The API uses the session bus only and exposes no control methods. In a sandboxed
+client, allow access to the specific service name below.
+
+| D-Bus endpoint | Value |
+| --- | --- |
+| Bus name and interface | `io.github.MukhilDharan5.UnityContextEngine.Context1` |
+| Object path | `/io/github/MukhilDharan5/UnityContextEngine/Context1` |
+
+| Member | Signature | Result |
+| --- | --- | --- |
+| `GetSnapshot` | `→ s` | JSON with the complete current snapshot |
+| `GetFields` | `as → s` | JSON with only the requested data fields. Unknown fields return `InvalidArgs`. |
+| `ListFields` | `→ as` | Available top-level field names |
+| `SnapshotUpdated` signal | `s` | Complete JSON snapshot pushed on each change |
+| `SnapshotChanged` signal | `t` | New revision number. Fetch the data with a method call. |
+
+Each JSON reply contains `api_version` (currently 1), a `revision`, and a
+`data` object. Revisions increase as data changes and restart with each
+provider. Data includes focus, recent and open windows, media and fullscreen
+state, game detection, compilers, active processes, CPU and memory pressure,
+idle state, source status, and ranked `workloads` with their evidence. Missing
+measurements use JSON `null`; consult `sources` for the collector status.
+Requests read the latest snapshot without rerunning the collectors.
+The `workload`, `workload_names`, and `media_playing` fields are convenient
+condition values for Automation Engine. The richer evidence remains in
+`workloads` and `media`.
+
+### Automation Engine integration
+
+Context Engine automatically connects to Automation Engine's provider-authenticated
+`ContextSink1` on the same session bus. It negotiates the fields needed by saved
+rules and publishes a complete selected snapshot immediately, then sends updates
+when those values change. `RequirementsChanged` picks up added or edited rules.
+Automation Engine never polls Context Engine or calls `GetSnapshot`. The
+`SnapshotUpdated` signal remains available to other read-only clients.
+
+Trigger conditions, mode enter/leave transitions, and `wait until` steps consume
+pushed facts. Updates are ordered, preserving brief true/false changes. A bounded
+queue resynchronizes to current state if an unresponsive receiver falls more
+than 256 updates behind. Provider loss clears stale data immediately. Reconnects
+negotiate fresh fields; cached lease renewals every 22.5 seconds keep unchanged
+readings live, and missing renewals expire after 45 seconds.
+
+Context Engine supplies local minute-boundary clock events, installed application
+metadata (inotify), desktop workloads, windows, media, idle status, and Unity
+device readings and action pick lists. Unity observation requests only `read` as
+**Unity Context Engine**. Its `unity` source, and Automation Engine's Devices page,
+show the exact `unityctl authorize :1.N` command when approval is required. The
+grant belongs to that running connection. Device readings cover every current
+Automation Engine trigger, including battery, transport/network, connectivity,
+audio, media, screen sharing, and call state. Unavailable readings remain unknown.
+Clipboard contents, SMS bodies, notification text, contact lists, and media
+artwork are excluded; action pick lists are bounded.
+
+Both engines must run in the same desktop session. Use `unity-context --serve`
+for collection without a window. The sandbox permits only the required Unity
+read methods and the two context sink calls; it has no device control methods.
+Device state is refreshed on Unity's change signals. CPU and process counters
+still use the configured sampling interval (default three seconds); their changes
+are pushed immediately after each sample. Use `--no-processes` to disable that
+sampling.
+
+```bash
+service=io.github.MukhilDharan5.UnityContextEngine.Context1
+path=/io/github/MukhilDharan5/UnityContextEngine/Context1
+gdbus call --session --dest "$service" --object-path "$path" \
+  --method "$service.GetSnapshot"
+gdbus call --session --dest "$service" --object-path "$path" \
+  --method "$service.GetFields" "['workloads', 'system_load', 'focus']"
+gdbus monitor --session --dest "$service" --object-path "$path"
+```
+
+## Terminal and JSON
+
+```bash
+python3 -m unity_context --tui                  # q quits; j/k scroll
+python3 -m unity_context --once                 # one JSON snapshot
+python3 -m unity_context --json                 # JSON on changes
+python3 -m unity_context --process-interval 10  # slower compiler sampling
+python3 -m unity_context --game-app org.example.Game
+python3 -m unity_context --focus none --no-media
+```
+
+The terminal and JSON modes can run without GTK. JSON can contain a window
+title. One-shot JSON allows up to four seconds for initial discovery. Run inside
+the desktop session as your normal user to access the display and session bus.
 
 ## Development
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m unity_context --demo --once
-# Optional local compositor fixtures + private D-Bus service (needs dbus-daemon):
 UNITY_CONTEXT_TEST_IPC=1 UNITY_CONTEXT_TEST_BUS=1 dbus-run-session -- \
   python3 -m unittest discover -s tests -v
+# Include the cross-engine contract and push-trigger tests:
+UNITY_CONTEXT_TEST_BUS=1 UNITY_AUTOMATION_SOURCE=../Unity_Automation_Engine \
+  dbus-run-session -- python3 -m unittest discover -s tests -v
 ```
 
-Protocol references: [MPRIS](https://specifications.freedesktop.org/mpris/latest/),
-[i3 IPC](https://i3wm.org/docs/ipc.html),
-[Hyprland IPC](https://wiki.hypr.land/IPC/),
-[EWMH](https://specifications.freedesktop.org/wm/latest-single/), and
-[/proc](https://www.kernel.org/doc/html/latest/filesystems/proc.html).
+[Libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/main/) ·
+[GNOME app icons](https://developer.gnome.org/hig/guidelines/app-icons.html) ·
+[GNOME Shell extensions](https://gjs.guide/extensions/) ·
+[Bubblewrap](https://github.com/containers/bubblewrap) ·
+[D-Bus proxy](https://github.com/flatpak/xdg-dbus-proxy) ·
+[Linux pressure counters](https://docs.kernel.org/accounting/psi.html) ·
+[MPRIS](https://specifications.freedesktop.org/mpris/latest/) ·
+[i3 IPC](https://i3wm.org/docs/ipc.html) ·
+[Hyprland IPC](https://wiki.hypr.land/IPC/) ·
+[EWMH](https://specifications.freedesktop.org/wm/latest-single/)
